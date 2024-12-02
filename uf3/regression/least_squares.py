@@ -354,6 +354,186 @@ class WeightedLinearModel(BasicLinearModel):
                     + ((1 - weight) * force_weight**2 * ord_f))
         return gram, ordinate
 
+
+    def build_design_matrix(self,
+                            filename: str,
+                            subset: Collection,
+                            weight: float = 0.5,
+                            batch_size=2500,
+                            sample_weights: Dict = None,
+                            energy_key="energy",
+                            progress: str = "bar",
+                            drop_columns: List[str] = None,
+                            UFF: bool = False,
+                            just_energies: bool = False,
+                            just_forces: bool = False):
+        
+        if (just_energies and just_forces):
+            raise ValueError("Cannot request both just_energies and just_forces")
+        if not os.path.isfile(filename):
+            raise FileNotFoundError(filename)
+        if not UFF:
+            n_tables, _, table_names, _ = io.analyze_hdf_tables(filename)
+            table_iterator = parallel.progress_iter(np.arange(n_tables),
+                                                    style=progress)
+        else:
+            h5py_fp = h5py.File(filename)
+            #table_iterator = list(h5py_fp.keys())
+            table_names = list(h5py_fp.keys())
+            table_iterator = parallel.progress_iter(np.arange(len(table_names)),
+                                                    style=progress)
+            h5py_fp.close()
+        
+        full_xe = []
+        full_ye = []
+        full_xf = []
+        full_yf = []
+
+        for j in table_iterator:
+            table_name = table_names[j]
+            if not UFF:
+                df = process.load_feature_db(filename, table_name)
+            else:
+                df = open_uff_feature(filename, table_name)
+
+                if UFF and type(subset[0]) != str:
+                    subset = [str(i) for i in subset]
+
+            keys = df.index.unique(level=0).intersection(subset)
+            if len(keys) == 0:
+                continue
+
+            if drop_columns != None:
+                df.drop(columns=drop_columns,inplace=True)
+
+            x_e, y_e, x_f, y_f = self.design_from_df(df,
+                                                    keys,
+                                                    sample_weights=sample_weights,
+                                                    energy_key=energy_key,
+                                                    just_energies=just_energies)
+            
+            # intermediates = self.gram_from_df(df,
+            #                                   keys,
+            #                                   e_variance=e_variance,
+            #                                   f_variance=f_variance,
+            #                                   sample_weights=sample_weights,
+            #                                   energy_key=energy_key,
+            #                                   batch_size=batch_size)
+            if not just_forces:
+                if len(full_xe) == 0:
+                    full_xe = x_e
+                    full_ye = y_e
+                else:
+                    full_xe = np.concatenate((full_xe,x_e),axis=0)
+                    full_ye = np.concatenate((full_ye,y_e))
+
+            if not just_energies:
+                if len(full_xf) == 0:
+                    full_xf = x_f
+                    full_yf = y_f
+                else:
+                    full_xf = np.concatenate((full_xf,x_f),axis=0)
+                    full_yf = np.concatenate((full_yf,y_f))
+
+        
+        #concatenate all the data
+        if just_energies:
+            x = full_xe
+            y = full_ye
+        elif just_forces:
+            x = full_xf
+            y = full_yf
+        else:
+            x = np.concatenate((full_xe,full_xf),axis=0)
+            y = np.concatenate((full_ye,full_yf))
+
+        return x, y
+
+            
+    def design_from_df(self,
+                    df: pd.DataFrame,
+                    keys: Collection,
+                    sample_weights: Dict = None,
+                    energy_key: str = "energy",
+                    just_energies: bool = False):
+        n_elements = len(self.bspline_config.element_list)
+        x_e, y_e, x_f, y_f = dataframe_to_tuples(df.loc[keys],
+                                                 n_elements=n_elements,
+                                                 energy_key=energy_key,
+                                                 sample_weights=sample_weights)
+        x_e, y_e = freeze_columns(x_e,
+                                  y_e,
+                                  self.mask,
+                                  self.frozen_c,
+                                  self.col_idx)
+
+        if just_energies:
+            return x_e, y_e, None, None
+        else:
+
+            x_f, y_f = freeze_columns(x_f,
+                                y_f,
+                                self.mask,
+                                self.frozen_c,
+                                self.col_idx)
+            
+            return x_e, y_e, x_f, y_f
+
+    def batched_predict(self,
+                        filename: str,
+                        keys: List[str] = None,
+                        table_names: List[str] = None,
+                        score: bool = True,
+                        drop_columns: List[str] = None,
+                        UFF: bool = False):
+        """
+        Extract inputs and outputs from HDF5 file and predict energies/forces.
+
+        Args:
+            filename: path to HDF5 file.
+            keys (list): keys to query from df (e.g. training subset).
+            table_names (list): list of table names in HDF5 to read.
+            score (bool): whether to return root mean square error metrics.
+
+        Returns:
+            y_e (np.ndarray): target values for energies.
+            p_e (np.ndarray): prediction values for energies.
+            y_f (np.ndarray): target values for forces.
+            p_f (np.ndarray): prediction values for forces.
+            rmse_e (np.ndarray): RMSE across energy predictions.
+            rmse_e (np.ndarray): RMSE across force predictions.
+            drop_columns (list): list of columns to drop. Used when modifying
+                the cutoffs of the feature vectors from HDF5 file. No internal
+                checks are performed to see if dropping provided columns produce
+                features of the intended cutoffs. Use with Caution.
+            UFF (bool): Whether the HDF5 file was created using 
+                        Ultra Fast Featurization
+        """
+        if UFF and type(keys[0])!=str:
+            keys = [str(i) for i in keys]
+        n_elements = len(self.bspline_config.element_list)
+        y_e, p_e, y_f, p_f = batched_prediction(self,
+                                                filename,
+                                                table_names=table_names,
+                                                subset_keys=keys,
+                                                n_elements=n_elements,
+                                                drop_columns=drop_columns,
+                                                UFF=UFF)
+        if score:
+            rmse_e = rmse_metric(y_e, p_e)
+            rmse_f = rmse_metric(y_f, p_f)
+            print(f"RMSE (energy): {rmse_e:.3F}")
+            print(f"RMSE (forces): {rmse_f:.3F}")
+            return y_e, p_e, y_f, p_f, rmse_e, rmse_f
+        else:
+            return y_e, p_e, y_f, p_f
+        
+
+        
+                              
+            
+    
+
     def fit_from_file(self,
                       filename: str,
                       subset: Collection,
@@ -482,6 +662,15 @@ class WeightedLinearModel(BasicLinearModel):
                                                  n_elements=n_elements,
                                                  energy_key=energy_key,
                                                  sample_weights=sample_weights)
+        # print('x_e')
+        # print(np.shape(x_e))
+        # print('y_e')
+        # print(y_e)
+        # print(np.shape(y_e))
+        # print('x_f')
+        # print(np.shape(x_f))
+        # print('y_f')
+        # print(np.shape(y_f))
         x_e, y_e = freeze_columns(x_e,
                                   y_e,
                                   self.mask,
@@ -492,6 +681,16 @@ class WeightedLinearModel(BasicLinearModel):
                                   self.mask,
                                   self.frozen_c,
                                   self.col_idx)
+        
+        # print('x_e_frozen')
+        # print(np.shape(x_e))
+        # print('y_e_frozen')
+        # print(y_e)
+        # print(np.shape(y_e))
+        # print('x_f_frozen')
+        # print(np.shape(x_f))
+        # print('y_f_frozen')
+        # print(np.shape(y_f))
         if e_variance is not None and f_variance is not None:
             e_variance.update(y_e)
             f_variance.update(y_f)
@@ -587,7 +786,9 @@ class WeightedLinearModel(BasicLinearModel):
             # TODO: proper deprecation
             warnings.warn("'solution' should be renamed to 'coefficients'")
             solution = solution["solution"]
-        for key in solution:
+
+        sol_copy = solution.copy()
+        for key in sol_copy:
             if isinstance(key, tuple):
                 sorted_key = composition.sort_interaction_symbols(key)
                 if sorted_key != key:
@@ -712,6 +913,8 @@ def dataframe_to_tuples(df_features,
         w (np.ndarray): weight vector for machine learning.
     """
     names = df_features.index.get_level_values(0)
+    #print(names)
+    #exit()
     y_index = df_features.index.get_level_values(-1)
     energy_mask = (y_index == energy_key)
     force_mask = np.logical_not(energy_mask)
@@ -730,7 +933,10 @@ def dataframe_to_tuples(df_features,
     x_f = x[force_mask]
 
     if sample_weights is not None:
+        print('sample_weights')
+        print(sample_weights)
         w = np.array([sample_weights.get(name, 1.0) for name in names])
+        print(w)
         w_e = w[energy_mask]
         w_f = w[force_mask]
         x_e = np.multiply(x_e.T, w_e).T
@@ -856,6 +1062,18 @@ def get_freezing_mask(n_feats: int, col_idx: np.ndarray) -> np.ndarray:
     mask = np.setdiff1d(np.arange(n_feats), col_idx)
     return mask
 
+
+def unfreeze_design_matrix(x: np.ndarray,
+                           n_coeff: int,
+                           mask: np.ndarray,
+                           frozen_c: np.ndarray,
+                           col_idx: np.ndarray):
+    
+    unfrozen_x = np.zeros([np.shape(x)[0], n_coeff])
+    unfrozen_x[:, mask] = x
+    unfrozen_x[:, col_idx] = frozen_c
+    return unfrozen_x
+    
 
 def freeze_columns(x: np.ndarray,
                    y: np.ndarray,
